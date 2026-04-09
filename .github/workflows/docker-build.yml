@@ -4,9 +4,14 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Component to build (gateway, cluster)"
+        description: "Component to build (gateway, sandbox, cluster)"
         required: true
         type: string
+      registry:
+        description: "Container registry to push to"
+        required: false
+        type: string
+        default: "ghcr.io/nvidia/openshell"
       timeout-minutes:
         description: "Job timeout in minutes"
         required: false
@@ -56,7 +61,7 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       IMAGE_TAG: ${{ github.sha }}
-      IMAGE_REGISTRY: ghcr.io/nvidia/openshell
+      IMAGE_REGISTRY: ${{ inputs.registry }}
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ inputs.platform }}
     steps:

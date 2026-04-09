@@ -36,6 +36,16 @@ description = "Alias for build:docker:gateway"
 depends = ["build:docker:gateway"]
 hide = true
 
+["build:docker:sandbox"]
+description = "Build the sandbox Docker image (base + supervisor binary)"
+run = "tasks/scripts/docker-build-image.sh sandbox"
+hide = true
+
+["docker:build:sandbox"]
+description = "Alias for build:docker:sandbox"
+depends = ["build:docker:sandbox"]
+hide = true
+
 ["build:docker:cluster"]
 description = "Build the k3s cluster image (component images pulled at runtime from registry)"
 run = "tasks/scripts/docker-build-image.sh cluster"

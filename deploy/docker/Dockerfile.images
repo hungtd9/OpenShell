@@ -170,8 +170,7 @@ COPY --from=supervisor-builder /build/out/openshell-sandbox /openshell-sandbox
 # ---------------------------------------------------------------------------
 FROM ghcr.io/nvidia/openshell-community/sandboxes/base:latest AS sandbox
 
-COPY --from=supervisor-builder /build/out/openshell-sandbox /opt/openshell/bin/openshell-sandbox
-RUN chmod +x /opt/openshell/bin/openshell-sandbox
+COPY --chmod=755 --from=supervisor-builder /build/out/openshell-sandbox /opt/openshell/bin/openshell-sandbox
 
 # ---------------------------------------------------------------------------
 # Final gateway image

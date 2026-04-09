@@ -1,8 +1,8 @@
-# Simplified image build for fork deployments.
-# Builds gateway and sandbox images on push to main and pushes to GHCR.
-# Uses standard GitHub Actions runners (no custom CI image or BuildKit endpoints).
+# Build gateway and sandbox images for the fork on public GitHub.
+# Produces the same multi-arch manifest (linux/amd64 + linux/arm64) and
+# flags (--provenance=false) as docker-build.yml, using GitHub-hosted runners.
 
-name: Build Images
+name: Build Fork Images
 
 on:
   push:
@@ -17,48 +17,61 @@ env:
   REGISTRY: ghcr.io/hungtd9/openshell
 
 jobs:
-  build-gateway:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  build:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [gateway, sandbox]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.images
-          target: gateway
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/gateway:${{ github.sha }}
-            ${{ env.REGISTRY }}/gateway:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          fetch-depth: 0
 
-  build-sandbox:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/docker/Dockerfile.images
-          target: sandbox
+          target: ${{ matrix.component }}
           push: true
+          provenance: false
           tags: |
-            ${{ env.REGISTRY }}/sandbox:${{ github.sha }}
-            ${{ env.REGISTRY }}/sandbox:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }},mode=max
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [gateway, sandbox]
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.sha }}" \
+            --tag "${{ env.REGISTRY }}/${{ matrix.component }}:latest" \
+            "${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.sha }}-amd64" \
+            "${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.sha }}-arm64"
