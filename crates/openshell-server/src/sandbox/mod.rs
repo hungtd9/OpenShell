@@ -909,9 +909,17 @@ fn sandbox_template_to_k8s(
     // processes to resolve binary identity for network policy enforcement),
     // and SYSLOG (for reading /dev/kmsg to surface bypass detection diagnostics).
     // This mirrors the capabilities used by `mise run sandbox`.
+    //
+    // `privileged: true` is required because the supervisor creates network
+    // namespaces via `mount --make-shared /run/netns`, which is blocked by
+    // default seccomp/AppArmor profiles even with SYS_ADMIN.  The upstream
+    // Docker deployment already runs the entire k3s node container as
+    // privileged (see bootstrap/docker.rs); on real Kubernetes clusters the
+    // pod must request it explicitly.
     container.insert(
         "securityContext".to_string(),
         serde_json::json!({
+            "privileged": true,
             "capabilities": {
                 "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
             }
@@ -1835,6 +1843,36 @@ mod tests {
             tls_vol["secret"]["defaultMode"],
             256, // 0o400
             "TLS secret volume must use mode 0400 to prevent sandbox user from reading the private key"
+        );
+    }
+
+    #[test]
+    fn sandbox_template_sets_privileged_true() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+            "",
+        );
+
+        let sc = &pod_template["spec"]["containers"][0]["securityContext"];
+        assert_eq!(sc["privileged"], true, "sandbox container must be privileged");
+        assert!(
+            sc["capabilities"]["add"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("SYS_ADMIN")),
+            "SYS_ADMIN capability must be present"
         );
     }
 
