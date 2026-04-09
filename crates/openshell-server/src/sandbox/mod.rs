@@ -35,42 +35,14 @@ const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
 
 // ---------------------------------------------------------------------------
-// Default workspace persistence (temporary — will be replaced by snapshotting)
+// Workspace volume
 // ---------------------------------------------------------------------------
-// Every sandbox pod gets a PVC-backed `/sandbox` directory so that user data
-// (installed packages, files, dotfiles) survives pod rescheduling across
-// gateway stop/start cycles.  An init container seeds the PVC with the
-// image's original `/sandbox` contents on first use so that the Python venv,
-// skills, and shell config are not lost when the empty PVC is mounted.
-//
-// NOTE: This PVC + init-container approach is a stopgap.  It has known
-// limitations: image upgrades don't propagate into existing PVCs, the init
-// copy adds first-start latency, and the full /sandbox directory is
-// duplicated on disk.  The plan is to replace this with proper container
-// snapshotting so that only the diff from the base image is persisted.
 
-/// Volume name used for the workspace PVC in the pod spec.
+/// Volume name used for the workspace in the pod spec.
 const WORKSPACE_VOLUME_NAME: &str = "workspace";
 
-/// Mount path for the workspace PVC in the **agent** container.  This shadows
-/// the image's `/sandbox` directory — the init container copies the image
-/// contents into the PVC before the agent starts.
+/// Mount path for the workspace in the agent container.
 const WORKSPACE_MOUNT_PATH: &str = "/sandbox";
-
-/// Mount path for the workspace PVC in the **init** container.  A temporary
-/// path so the init container can see the image's original `/sandbox` and
-/// copy it into the PVC.
-const WORKSPACE_INIT_MOUNT_PATH: &str = "/workspace-pvc";
-
-/// Name of the init container that seeds the workspace PVC.
-const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
-
-/// Default storage request for the workspace PVC.
-const WORKSPACE_DEFAULT_STORAGE: &str = "2Gi";
-
-/// Sentinel file written by the init container after copying the image's
-/// `/sandbox` contents.  Subsequent pod starts skip the copy.
-const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 
 #[derive(Clone)]
 pub struct SandboxClient {
@@ -89,6 +61,9 @@ pub struct SandboxClient {
     /// When non-empty, sandbox pods get `hostAliases` entries mapping
     /// `host.docker.internal` and `host.openshell.internal` to this IP.
     host_gateway_ip: String,
+    /// JSON-encoded Kubernetes volume spec for the sandbox workspace.
+    /// Defaults to `{"emptyDir":{}}` when empty.
+    sandbox_workspace_volume: String,
 }
 
 impl std::fmt::Debug for SandboxClient {
@@ -112,6 +87,7 @@ impl SandboxClient {
         ssh_handshake_skew_secs: u64,
         client_tls_secret_name: String,
         host_gateway_ip: String,
+        sandbox_workspace_volume: String,
     ) -> Result<Self, KubeError> {
         let mut config = match kube::Config::incluster() {
             Ok(c) => c,
@@ -134,6 +110,7 @@ impl SandboxClient {
             ssh_handshake_skew_secs,
             client_tls_secret_name,
             host_gateway_ip,
+            sandbox_workspace_volume,
         })
     }
 
@@ -230,6 +207,7 @@ impl SandboxClient {
             self.ssh_handshake_skew_secs(),
             &self.client_tls_secret_name,
             &self.host_gateway_ip,
+            &self.sandbox_workspace_volume,
         );
         let api = self.api();
 
@@ -665,69 +643,26 @@ fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
     Err("sandbox id not found on object".to_string())
 }
 
-/// Path where the supervisor binary is mounted inside the agent container.
-/// The supervisor is always side-loaded from the k3s node filesystem via a
-/// read-only hostPath volume — it is never baked into sandbox images.
-const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin";
+/// Path where the supervisor binary lives inside the sandbox image.
+const SUPERVISOR_BIN_PATH: &str = "/opt/openshell/bin";
 
-/// Name of the volume used to side-load the supervisor binary.
-const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
-
-/// Path on the k3s node filesystem where the supervisor binary lives.
-/// This is baked into the cluster image at build time and can be updated
-/// via `docker cp` during local development.
-const SUPERVISOR_HOST_PATH: &str = "/opt/openshell/bin";
-
-/// Build the hostPath volume definition that exposes the supervisor binary
-/// from the k3s node filesystem.
-fn supervisor_volume() -> serde_json::Value {
-    serde_json::json!({
-        "name": SUPERVISOR_VOLUME_NAME,
-        "hostPath": {
-            "path": SUPERVISOR_HOST_PATH,
-            "type": "DirectoryOrCreate"
-        }
-    })
-}
-
-/// Build the read-only volume mount for the supervisor binary in the agent container.
-fn supervisor_volume_mount() -> serde_json::Value {
-    serde_json::json!({
-        "name": SUPERVISOR_VOLUME_NAME,
-        "mountPath": SUPERVISOR_MOUNT_PATH,
-        "readOnly": true
-    })
-}
-
-/// Apply supervisor side-load transforms to an already-built pod template JSON.
+/// Apply supervisor transforms to an already-built pod template JSON.
 ///
-/// This injects the hostPath volume, volume mount, command override, and
-/// `runAsUser: 0` into the pod template, targeting the `agent` container
-/// (or the first container if no `agent` is found).
+/// Overrides the command and `runAsUser` on the `agent` container (or the
+/// first container if no `agent` is found).  The supervisor binary is
+/// expected to be baked into the sandbox image at build time — no hostPath
+/// volume or init container is needed.
 ///
-/// The supervisor binary is always side-loaded from the k3s node filesystem
-/// via a read-only hostPath volume. No init container is needed.
-///
-/// The `runAsUser: 0` override ensures the supervisor binary runs as root
-/// regardless of the image's `USER` directive. The supervisor needs root for
-/// network namespace creation, proxy setup, and Landlock/seccomp configuration.
-/// It drops to the appropriate non-root user for child processes via the
-/// policy's `run_as_user`/`run_as_group`.
+/// `runAsUser: 0` ensures the supervisor runs as root regardless of the
+/// image's `USER` directive.  The supervisor needs root for network namespace
+/// creation, proxy setup, and Landlock/seccomp configuration.  It drops to
+/// the appropriate non-root user for child processes via the policy's
+/// `run_as_user`/`run_as_group`.
 fn apply_supervisor_sideload(pod_template: &mut serde_json::Value) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
 
-    // 1. Add the hostPath volume to spec.volumes
-    let volumes = spec
-        .entry("volumes")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut();
-    if let Some(volumes) = volumes {
-        volumes.push(supervisor_volume());
-    }
-
-    // 2. Find the agent container and add volume mount + command override
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
         return;
     };
@@ -742,60 +677,47 @@ fn apply_supervisor_sideload(pod_template: &mut serde_json::Value) {
     let index = target_index.unwrap_or(0);
 
     if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
-        // Override command to use the side-loaded supervisor binary
         container.insert(
             "command".to_string(),
-            serde_json::json!([format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH)]),
+            serde_json::json!([format!("{}/openshell-sandbox", SUPERVISOR_BIN_PATH)]),
         );
 
-        // Force the supervisor to run as root (UID 0). Sandbox images may set
-        // a non-root USER directive (e.g. `USER sandbox`), but the supervisor
-        // needs root to create network namespaces, set up the proxy, and
-        // configure Landlock/seccomp. The supervisor itself drops privileges
-        // for child processes via the policy's `run_as_user`/`run_as_group`.
         let security_context = container
             .entry("securityContext")
             .or_insert_with(|| serde_json::json!({}));
         if let Some(sc) = security_context.as_object_mut() {
             sc.insert("runAsUser".to_string(), serde_json::json!(0));
         }
-
-        // Add volume mount
-        let volume_mounts = container
-            .entry("volumeMounts")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut();
-        if let Some(volume_mounts) = volume_mounts {
-            volume_mounts.push(supervisor_volume_mount());
-        }
     }
 }
 
-/// Apply workspace persistence transforms to an already-built pod template.
+/// Apply workspace volume to an already-built pod template.
 ///
-/// This injects:
-///   1. A volume mount on the agent container at `/sandbox`.
-///   2. An init container (same image) that seeds the PVC with the image's
-///      original `/sandbox` contents on first use.
-///
-/// The PVC volume itself is **not** added here — the Sandbox CRD controller
-/// automatically creates a volume for each entry in `volumeClaimTemplates`
-/// (following the StatefulSet convention).  Adding one here would create a
-/// duplicate volume name and fail pod validation.
-///
-/// The init container mounts the PVC at a temporary path so it can still see
-/// the image's `/sandbox` directory.  It checks for a sentinel file and skips
-/// the copy if the PVC was already initialised.
-fn apply_workspace_persistence(
-    pod_template: &mut serde_json::Value,
-    image: &str,
-    image_pull_policy: &str,
-) {
+/// Adds a volume (from `workspace_volume_json`) and a volume mount at
+/// `/sandbox` on the agent container.  When `workspace_volume_json` is empty
+/// or not valid JSON, defaults to `emptyDir: {}`.
+fn apply_workspace_volume(pod_template: &mut serde_json::Value, workspace_volume_json: &str) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
 
-    // 1. Add workspace volume mount to the agent container
+    let mut vol_spec: serde_json::Value =
+        serde_json::from_str(workspace_volume_json).unwrap_or_else(|_| serde_json::json!({}));
+    if !vol_spec.is_object() || vol_spec.as_object().map_or(true, |m| m.is_empty()) {
+        vol_spec = serde_json::json!({"emptyDir": {}});
+    }
+    if let Some(obj) = vol_spec.as_object_mut() {
+        obj.insert("name".to_string(), serde_json::json!(WORKSPACE_VOLUME_NAME));
+    }
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        volumes.push(vol_spec);
+    }
+
     let containers = spec.get_mut("containers").and_then(|v| v.as_array_mut());
     if let Some(containers) = containers {
         let mut target_index = None;
@@ -820,69 +742,6 @@ fn apply_workspace_persistence(
             }
         }
     }
-
-    // 3. Add the init container that seeds the PVC from the image
-    let init_containers = spec
-        .entry("initContainers")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut();
-    if let Some(init_containers) = init_containers {
-        // The init container mounts the PVC at a temp path so it can still
-        // read the image's original /sandbox contents.  It copies them into
-        // the PVC only when the sentinel file is absent.
-        //
-        // Prefer a tar stream over `cp -a`: some sandbox images contain
-        // self-referential symlinks under `/sandbox/.uv`, and GNU cp can
-        // fail while seeding the PVC even though preserving the symlink as-is
-        // is valid. `tar` copies the tree without dereferencing those links.
-        //
-        // The inner `[ -d ... ]` guard handles custom images that don't have
-        // a /sandbox directory — the copy is skipped but the sentinel is
-        // still written so subsequent starts are instant.
-        let copy_cmd = format!(
-            "if [ ! -f {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL} ]; then \
-               if [ -d {WORKSPACE_MOUNT_PATH} ]; then \
-                 tar -C {WORKSPACE_MOUNT_PATH} -cf - . | tar -C {WORKSPACE_INIT_MOUNT_PATH} -xpf -; \
-               fi && \
-               touch {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL}; \
-             fi"
-        );
-
-        let mut init_spec = serde_json::json!({
-            "name": WORKSPACE_INIT_CONTAINER_NAME,
-            "image": image,
-            "command": ["sh", "-c", copy_cmd],
-            "securityContext": { "runAsUser": 0 },
-            "volumeMounts": [{
-                "name": WORKSPACE_VOLUME_NAME,
-                "mountPath": WORKSPACE_INIT_MOUNT_PATH
-            }]
-        });
-        if !image_pull_policy.is_empty() {
-            init_spec["imagePullPolicy"] = serde_json::json!(image_pull_policy);
-        }
-        init_containers.push(init_spec);
-    }
-}
-
-/// Build the default `volumeClaimTemplates` array for sandbox pods.
-///
-/// Provides a single PVC named "workspace" that backs the `/sandbox`
-/// directory.  The init container seeds it from the image on first use.
-fn default_workspace_volume_claim_templates() -> serde_json::Value {
-    serde_json::json!([{
-        "metadata": {
-            "name": WORKSPACE_VOLUME_NAME
-        },
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {
-                "requests": {
-                    "storage": WORKSPACE_DEFAULT_STORAGE
-                }
-            }
-        }
-    }])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -898,19 +757,9 @@ fn sandbox_to_k8s_spec(
     ssh_handshake_skew_secs: u64,
     client_tls_secret_name: &str,
     host_gateway_ip: &str,
+    workspace_volume_json: &str,
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
-
-    // Determine early whether the user provided custom volumeClaimTemplates.
-    // When they haven't, we inject a default workspace VCT and corresponding
-    // init container + volume mount so sandbox data persists.  We need this
-    // flag before building the podTemplate because the workspace persistence
-    // transforms are applied inside sandbox_template_to_k8s.
-    let user_has_vct = spec
-        .and_then(|s| s.template.as_ref())
-        .and_then(|t| struct_to_json(&t.volume_claim_templates))
-        .is_some();
-    let inject_workspace = !user_has_vct;
 
     if let Some(spec) = spec {
         if !spec.log_level.is_empty() {
@@ -939,7 +788,7 @@ fn sandbox_to_k8s_spec(
                     &spec.environment,
                     client_tls_secret_name,
                     host_gateway_ip,
-                    inject_workspace,
+                    workspace_volume_json,
                 ),
             );
             if !template.agent_socket.is_empty() {
@@ -954,16 +803,6 @@ fn sandbox_to_k8s_spec(
         }
     }
 
-    // Inject the default workspace volumeClaimTemplate when the user didn't
-    // provide their own.
-    if inject_workspace {
-        root.insert(
-            "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(),
-        );
-    }
-
-    // podTemplate is required by the Kubernetes CRD - ensure it's always present
     if !root.contains_key("podTemplate") {
         let empty_env = std::collections::HashMap::new();
         let spec_env = spec.as_ref().map_or(&empty_env, |s| &s.environment);
@@ -983,7 +822,7 @@ fn sandbox_to_k8s_spec(
                 spec_env,
                 client_tls_secret_name,
                 host_gateway_ip,
-                inject_workspace,
+                workspace_volume_json,
             ),
         );
     }
@@ -1008,10 +847,8 @@ fn sandbox_template_to_k8s(
     spec_environment: &std::collections::HashMap<String, String>,
     client_tls_secret_name: &str,
     host_gateway_ip: &str,
-    inject_workspace: bool,
+    workspace_volume_json: &str,
 ) -> serde_json::Value {
-    // The supervisor binary is always side-loaded from the node filesystem
-    // via a hostPath volume, regardless of which sandbox image is used.
 
     let mut metadata = serde_json::Map::new();
     if !template.labels.is_empty() {
@@ -1132,15 +969,8 @@ fn sandbox_template_to_k8s(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    // Always side-load the supervisor binary from the node filesystem
     apply_supervisor_sideload(&mut result);
-
-    // Inject workspace persistence (init container + PVC volume mount) so
-    // that /sandbox data survives pod rescheduling.  Skipped when the user
-    // provides custom volumeClaimTemplates to avoid conflicts.
-    if inject_workspace {
-        apply_workspace_persistence(&mut result, image, image_pull_policy);
-    }
+    apply_workspace_volume(&mut result, workspace_volume_json);
 
     result
 }
@@ -1698,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_sideload_injects_hostpath_volume_and_mount() {
+    fn supervisor_sideload_overrides_command_no_volumes() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
@@ -1710,38 +1540,24 @@ mod tests {
 
         apply_supervisor_sideload(&mut pod_template);
 
-        // No init containers should be present (hostPath, not emptyDir+init)
+        // No volumes or volume mounts — the binary is baked into the image
         assert!(
-            pod_template["spec"]["initContainers"].is_null(),
-            "hostPath sideload should not create init containers"
+            pod_template["spec"]["volumes"].is_null(),
+            "supervisor sideload should not inject volumes"
+        );
+        assert!(
+            pod_template["spec"]["containers"][0]["volumeMounts"].is_null(),
+            "supervisor sideload should not inject volume mounts"
         );
 
-        // Volume should be a hostPath volume
-        let volumes = pod_template["spec"]["volumes"]
-            .as_array()
-            .expect("volumes should exist");
-        assert_eq!(volumes.len(), 1);
-        assert_eq!(volumes[0]["name"], SUPERVISOR_VOLUME_NAME);
-        assert_eq!(volumes[0]["hostPath"]["path"], SUPERVISOR_HOST_PATH);
-        assert_eq!(volumes[0]["hostPath"]["type"], "DirectoryOrCreate");
-
-        // Agent container command should be overridden
+        // Command should be overridden
         let command = pod_template["spec"]["containers"][0]["command"]
             .as_array()
             .expect("command should be set");
         assert_eq!(
             command[0].as_str().unwrap(),
-            format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH)
+            format!("{}/openshell-sandbox", SUPERVISOR_BIN_PATH)
         );
-
-        // Volume mount should be read-only
-        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
-            .as_array()
-            .expect("volumeMounts should exist");
-        assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0]["name"], SUPERVISOR_VOLUME_NAME);
-        assert_eq!(mounts[0]["mountPath"], SUPERVISOR_MOUNT_PATH);
-        assert_eq!(mounts[0]["readOnly"], true);
     }
 
     /// Regression test: TLS mount path must match env var paths.
@@ -1814,7 +1630,7 @@ mod tests {
             &std::collections::HashMap::new(),
             "",
             "",
-            true,
+            "",
         );
 
         assert_eq!(
@@ -1848,7 +1664,7 @@ mod tests {
             &std::collections::HashMap::new(),
             "",
             "",
-            true,
+            "",
         );
 
         assert_eq!(
@@ -1878,7 +1694,7 @@ mod tests {
             &std::collections::HashMap::new(),
             "",
             "",
-            true,
+            "",
         );
 
         assert_eq!(
@@ -1921,7 +1737,7 @@ mod tests {
             &std::collections::HashMap::new(),
             "",
             "",
-            true,
+            "",
         );
 
         let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
@@ -1948,7 +1764,7 @@ mod tests {
             &std::collections::HashMap::new(),
             "",
             "172.17.0.1",
-            true,
+            "",
         );
 
         let host_aliases = pod_template["spec"]["hostAliases"]
@@ -1979,7 +1795,7 @@ mod tests {
             &std::collections::HashMap::new(),
             "",
             "",
-            true,
+            "",
         );
 
         assert!(
@@ -2005,7 +1821,7 @@ mod tests {
             &std::collections::HashMap::new(),
             "my-tls-secret",
             "",
-            true,
+            "",
         );
 
         let volumes = pod_template["spec"]["volumes"]
@@ -2027,7 +1843,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn workspace_persistence_injects_init_container_volume_and_mount() {
+    fn workspace_volume_defaults_to_emptydir() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
@@ -2037,140 +1853,83 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(
-            &mut pod_template,
-            "openshell/sandbox:latest",
-            "IfNotPresent",
-        );
+        apply_workspace_volume(&mut pod_template, "");
 
-        // Init container
-        let init_containers = pod_template["spec"]["initContainers"]
+        let volumes = pod_template["spec"]["volumes"]
             .as_array()
-            .expect("initContainers should exist");
-        assert_eq!(init_containers.len(), 1);
-        assert_eq!(init_containers[0]["name"], WORKSPACE_INIT_CONTAINER_NAME);
-        assert_eq!(init_containers[0]["image"], "openshell/sandbox:latest");
-        assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
-        assert_eq!(init_containers[0]["securityContext"]["runAsUser"], 0);
+            .expect("volumes should exist");
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["name"], WORKSPACE_VOLUME_NAME);
+        assert!(!volumes[0]["emptyDir"].is_null(), "default should be emptyDir");
 
-        // Init container mounts PVC at temp path, not /sandbox
-        let init_mounts = init_containers[0]["volumeMounts"]
+        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
             .as_array()
-            .expect("init volumeMounts should exist");
-        assert_eq!(init_mounts.len(), 1);
-        assert_eq!(init_mounts[0]["name"], WORKSPACE_VOLUME_NAME);
-        assert_eq!(init_mounts[0]["mountPath"], WORKSPACE_INIT_MOUNT_PATH);
-
-        // Agent container mounts PVC at /sandbox
-        let agent_mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
-            .as_array()
-            .expect("agent volumeMounts should exist");
-        let workspace_mount = agent_mounts
-            .iter()
-            .find(|m| m["name"] == WORKSPACE_VOLUME_NAME)
-            .expect("workspace mount should exist on agent container");
-        assert_eq!(workspace_mount["mountPath"], WORKSPACE_MOUNT_PATH);
-
-        // The PVC volume is NOT created by apply_workspace_persistence — the
-        // Sandbox CRD controller adds it from the volumeClaimTemplates.
-        // Verify we did not inject one (which would cause a duplicate).
-        let has_pvc_vol = pod_template["spec"]["volumes"]
-            .as_array()
-            .map_or(false, |vols| {
-                vols.iter().any(|v| v["name"] == WORKSPACE_VOLUME_NAME)
-            });
-        assert!(
-            !has_pvc_vol,
-            "apply_workspace_persistence must NOT add a PVC volume (the CRD controller does that)"
-        );
+            .expect("volumeMounts should exist");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["name"], WORKSPACE_VOLUME_NAME);
+        assert_eq!(mounts[0]["mountPath"], WORKSPACE_MOUNT_PATH);
     }
 
     #[test]
-    fn workspace_persistence_uses_same_image_as_agent() {
+    fn workspace_volume_accepts_hostpath_json() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
                     "name": "agent",
-                    "image": "my-custom-image:v2"
+                    "image": "openshell/sandbox:latest"
                 }]
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "my-custom-image:v2", "IfNotPresent");
+        let json = r#"{"hostPath":{"path":"/data","type":"DirectoryOrCreate"}}"#;
+        apply_workspace_volume(&mut pod_template, json);
 
-        let init_image = pod_template["spec"]["initContainers"][0]["image"]
-            .as_str()
-            .expect("init container should have image");
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        assert_eq!(volumes[0]["name"], WORKSPACE_VOLUME_NAME);
+        assert_eq!(volumes[0]["hostPath"]["path"], "/data");
+    }
+
+    #[test]
+    fn workspace_volume_accepts_pvc_json() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "openshell/sandbox:latest"
+                }]
+            }
+        });
+
+        let json = r#"{"persistentVolumeClaim":{"claimName":"my-pvc"}}"#;
+        apply_workspace_volume(&mut pod_template, json);
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        assert_eq!(volumes[0]["name"], WORKSPACE_VOLUME_NAME);
         assert_eq!(
-            init_image, "my-custom-image:v2",
-            "init container must use the same image as the agent container"
+            volumes[0]["persistentVolumeClaim"]["claimName"], "my-pvc"
         );
     }
 
     #[test]
-    fn workspace_init_command_checks_sentinel() {
+    fn workspace_volume_falls_back_to_emptydir_on_invalid_json() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
                     "name": "agent",
-                    "image": "img:latest"
+                    "image": "openshell/sandbox:latest"
                 }]
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always");
+        apply_workspace_volume(&mut pod_template, "not-json");
 
-        let cmd = pod_template["spec"]["initContainers"][0]["command"]
+        let volumes = pod_template["spec"]["volumes"]
             .as_array()
-            .expect("command should be an array");
-        let script = cmd[2].as_str().expect("third element should be the script");
-        assert!(
-            script.contains(WORKSPACE_SENTINEL),
-            "init script must check for sentinel file"
-        );
-        assert!(
-            script.contains("tar -C"),
-            "init script must seed image contents with a tar stream"
-        );
-    }
-
-    #[test]
-    fn workspace_persistence_skipped_when_inject_workspace_false() {
-        let pod_template = sandbox_template_to_k8s(
-            &SandboxTemplate::default(),
-            false,
-            "openshell/sandbox:latest",
-            "",
-            "sandbox-id",
-            "sandbox-name",
-            "https://gateway.example.com",
-            "0.0.0.0:2222",
-            "secret",
-            300,
-            &std::collections::HashMap::new(),
-            "",
-            "",
-            false, // user provided custom VCTs
-        );
-
-        // No init container should be present
-        assert!(
-            pod_template["spec"]["initContainers"].is_null()
-                || pod_template["spec"]["initContainers"]
-                    .as_array()
-                    .is_none_or(|a| a.is_empty()),
-            "workspace init container must NOT be present when inject_workspace is false"
-        );
-
-        // No workspace volume mount on agent
-        let has_workspace_mount = pod_template["spec"]["containers"][0]["volumeMounts"]
-            .as_array()
-            .map_or(false, |mounts| {
-                mounts.iter().any(|m| m["name"] == WORKSPACE_VOLUME_NAME)
-            });
-        assert!(
-            !has_workspace_mount,
-            "workspace mount must NOT be present when inject_workspace is false"
-        );
+            .expect("volumes should exist");
+        assert!(!volumes[0]["emptyDir"].is_null(), "invalid JSON should fallback to emptyDir");
     }
 }

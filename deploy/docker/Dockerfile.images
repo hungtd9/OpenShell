@@ -7,6 +7,7 @@
 #
 # Targets:
 #   gateway             Final gateway image
+#   sandbox             Sandbox image with supervisor binary baked in
 #   cluster             Final cluster image
 #   gateway-builder     Release openshell-server binary
 #   supervisor-builder  Release openshell-sandbox binary
@@ -163,6 +164,14 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/us
 # binary (~20-40 MB) instead of the entire build environment (~968 MB).
 FROM scratch AS supervisor-output
 COPY --from=supervisor-builder /build/out/openshell-sandbox /openshell-sandbox
+
+# ---------------------------------------------------------------------------
+# Sandbox image with supervisor binary baked in
+# ---------------------------------------------------------------------------
+FROM ghcr.io/nvidia/openshell-community/sandboxes/base:latest AS sandbox
+
+COPY --from=supervisor-builder /build/out/openshell-sandbox /opt/openshell/bin/openshell-sandbox
+RUN chmod +x /opt/openshell/bin/openshell-sandbox
 
 # ---------------------------------------------------------------------------
 # Final gateway image
