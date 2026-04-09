@@ -84,6 +84,12 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
+
+    /// JSON-encoded Kubernetes volume spec for sandbox workspace.
+    /// Passed through verbatim into the pod template's `spec.volumes` entry.
+    /// When empty, defaults to `{"emptyDir":{}}`.
+    #[serde(default)]
+    pub sandbox_workspace_volume: String,
 }
 
 /// TLS configuration.
@@ -133,6 +139,7 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
+            sandbox_workspace_volume: String::new(),
         }
     }
 
@@ -245,6 +252,12 @@ impl Config {
     #[must_use]
     pub fn with_host_gateway_ip(mut self, ip: impl Into<String>) -> Self {
         self.host_gateway_ip = ip.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_sandbox_workspace_volume(mut self, vol: impl Into<String>) -> Self {
+        self.sandbox_workspace_volume = vol.into();
         self
     }
 }

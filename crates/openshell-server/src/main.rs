@@ -97,6 +97,11 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
+    /// JSON-encoded Kubernetes volume spec for sandbox workspace.
+    /// Defaults to emptyDir when not set.
+    #[arg(long, env = "OPENSHELL_SANDBOX_WORKSPACE_VOLUME")]
+    sandbox_workspace_volume: Option<String>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -186,6 +191,10 @@ async fn main() -> Result<()> {
 
     if let Some(ip) = args.host_gateway_ip {
         config = config.with_host_gateway_ip(ip);
+    }
+
+    if let Some(vol) = args.sandbox_workspace_volume {
+        config = config.with_sandbox_workspace_volume(vol);
     }
 
     if args.disable_tls {
