@@ -1264,6 +1264,58 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
         );
     }
 
+    // Inject cluster-wide defaults from environment variables.  These are
+    // read by the K8s driver from platform_config and allow operators to
+    // configure workspace volumes, sidecar containers, image pull secrets,
+    // and sandbox commands for all sandboxes without per-sandbox API changes.
+    for (key, env_var) in [
+        ("workspace_volume", "OPENSHELL_SANDBOX_WORKSPACE_VOLUME"),
+        ("sidecar_containers", "OPENSHELL_SIDECAR_CONTAINERS"),
+        ("image_pull_secrets", "OPENSHELL_SANDBOX_IMAGE_PULL_SECRETS"),
+        ("sandbox_command", "OPENSHELL_DEFAULT_SANDBOX_COMMAND"),
+    ] {
+        if let Ok(val) = std::env::var(env_var) {
+            if !val.is_empty() {
+                fields.insert(
+                    key.to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue(val)),
+                    },
+                );
+            }
+        }
+    }
+
+    // node_selector needs StructValue (the K8s driver reads it via
+    // platform_config_struct), so parse the JSON env var into a
+    // prost Struct rather than passing it as a plain string.
+    if let Ok(val) = std::env::var("OPENSHELL_SANDBOX_NODE_SELECTOR") {
+        if !val.is_empty() {
+            if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&val)
+            {
+                let sel_fields = map
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            Value {
+                                kind: Some(Kind::StringValue(v)),
+                            },
+                        )
+                    })
+                    .collect();
+                fields.insert(
+                    "node_selector".to_string(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct {
+                            fields: sel_fields,
+                        })),
+                    },
+                );
+            }
+        }
+    }
+
     if fields.is_empty() {
         None
     } else {

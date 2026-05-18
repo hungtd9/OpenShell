@@ -1084,7 +1084,11 @@ fn sandbox_to_k8s_spec(
         .and_then(|s| s.template.as_ref())
         .and_then(|t| platform_config_struct(t, "volume_claim_templates"))
         .is_some();
-    let inject_workspace = !user_has_vct;
+    let has_custom_workspace = spec
+        .and_then(|s| s.template.as_ref())
+        .and_then(|t| platform_config_string(t, "workspace_volume"))
+        .is_some_and(|s| !s.is_empty());
+    let inject_workspace = !user_has_vct && !has_custom_workspace;
 
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
@@ -1205,7 +1209,7 @@ fn sandbox_template_to_k8s(
     }
 
     // Build environment variables - start with OpenShell-required vars
-    let env = build_env_list(
+    let mut env = build_env_list(
         None,
         &template.environment,
         spec_environment,
@@ -1215,6 +1219,10 @@ fn sandbox_template_to_k8s(
         params.ssh_socket_path,
         !params.client_tls_secret_name.is_empty(),
     );
+
+    let sandbox_cmd = platform_config_string(template, "sandbox_command")
+        .unwrap_or_else(|| "sleep infinity".to_string());
+    upsert_env(&mut env, "OPENSHELL_SANDBOX_COMMAND", &sandbox_cmd);
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
@@ -1293,14 +1301,162 @@ fn sandbox_template_to_k8s(
         params.supervisor_sideload_method,
     );
 
-    // Inject workspace persistence (init container + PVC volume mount) so
-    // that /sandbox data survives pod rescheduling.  Skipped when the user
-    // provides custom volumeClaimTemplates to avoid conflicts.
-    if inject_workspace {
+    // Workspace persistence: platform_config.workspace_volume overrides the
+    // default PVC + init-container seeding with a custom volume spec (e.g.
+    // emptyDir or a secondary StorageClass).
+    if let Some(vol) = platform_config_string(template, "workspace_volume") {
+        if !vol.is_empty() {
+            apply_workspace_volume(&mut result, &vol);
+        }
+    } else if inject_workspace {
         apply_workspace_persistence(&mut result, image, params.image_pull_policy);
     }
 
+    if let Some(secrets) = platform_config_string(template, "image_pull_secrets") {
+        apply_image_pull_secrets(&mut result, &secrets);
+    }
+
+    if let Some(sidecars) = platform_config_string(template, "sidecar_containers") {
+        apply_sidecar_containers(&mut result, &sidecars);
+    }
+
     result
+}
+
+/// Apply a custom workspace volume to an already-built pod template.
+///
+/// Adds a volume (parsed from `volume_json`, defaulting to emptyDir) and a
+/// mount at `/sandbox` on the agent container.  Used as an alternative to the
+/// PVC-based persistence when `platform_config.workspace_volume` is set.
+fn apply_workspace_volume(pod_template: &mut serde_json::Value, volume_json: &str) {
+    let volume_spec: serde_json::Value = if volume_json.is_empty() {
+        serde_json::json!({"emptyDir": {}})
+    } else {
+        serde_json::from_str(volume_json).unwrap_or_else(|_| serde_json::json!({"emptyDir": {}}))
+    };
+
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        let mut vol = serde_json::json!({"name": WORKSPACE_VOLUME_NAME});
+        if let Some(obj) = vol.as_object_mut() {
+            if let Some(spec_obj) = volume_spec.as_object() {
+                for (k, v) in spec_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        volumes.push(vol);
+    }
+
+    let containers = spec.get_mut("containers").and_then(|v| v.as_array_mut());
+    if let Some(containers) = containers {
+        let target_index = containers
+            .iter()
+            .position(|c| c.get("name").and_then(|n| n.as_str()) == Some("agent"));
+        let index = target_index.unwrap_or(0);
+        if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
+            let volume_mounts = container
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut();
+            if let Some(volume_mounts) = volume_mounts {
+                volume_mounts.push(serde_json::json!({
+                    "name": WORKSPACE_VOLUME_NAME,
+                    "mountPath": WORKSPACE_MOUNT_PATH
+                }));
+            }
+        }
+    }
+}
+
+/// Inject `imagePullSecrets` into the pod spec from a comma-separated list
+/// of Kubernetes Secret names.
+fn apply_image_pull_secrets(pod_template: &mut serde_json::Value, secrets_csv: &str) {
+    if secrets_csv.is_empty() {
+        return;
+    }
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    let entries: Vec<serde_json::Value> = secrets_csv
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|name| serde_json::json!({"name": name}))
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let pull_secrets = spec
+        .entry("imagePullSecrets")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(pull_secrets) = pull_secrets {
+        pull_secrets.extend(entries);
+    }
+}
+
+/// Append sidecar containers parsed from a JSON array to the pod's main
+/// container list (`spec.containers`).
+///
+/// Also injects an `openshell-ipc` emptyDir volume mounted at
+/// `/run/openshell` on both the agent container and every sidecar.  This
+/// volume carries the supervisor SSH socket, keeping it outside the
+/// Landlock-writable `/sandbox` tree so the sandboxed process cannot reach it.
+fn apply_sidecar_containers(pod_template: &mut serde_json::Value, sidecar_json: &str) {
+    if sidecar_json.is_empty() {
+        return;
+    }
+    let Ok(sidecars) = serde_json::from_str::<Vec<serde_json::Value>>(sidecar_json) else {
+        return;
+    };
+
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    const IPC_VOLUME_NAME: &str = "openshell-ipc";
+    const IPC_MOUNT_PATH: &str = "/run/openshell";
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        volumes.push(serde_json::json!({
+            "name": IPC_VOLUME_NAME,
+            "emptyDir": {}
+        }));
+    }
+
+    if let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) {
+        for c in containers.iter_mut() {
+            if c.get("name").and_then(|v| v.as_str()) == Some("agent") {
+                let mounts = c
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("volumeMounts")
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut();
+                if let Some(mounts) = mounts {
+                    mounts.push(serde_json::json!({
+                        "name": IPC_VOLUME_NAME,
+                        "mountPath": IPC_MOUNT_PATH
+                    }));
+                }
+                break;
+            }
+        }
+
+        containers.extend(sidecars);
+    }
 }
 
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
