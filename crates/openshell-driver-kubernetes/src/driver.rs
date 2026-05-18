@@ -1183,6 +1183,18 @@ fn sandbox_template_to_k8s(
         }
     }
 
+    // Share the pod's PID namespace across all containers when the operator
+    // opts in via platform_config.share_process_namespace. Required for the
+    // supervisor's `unshare(CLONE_NEWNET)` + `setns()` netns handoff to reach
+    // the helper child's `/proc/<pid>/ns/net` from the main container — i.e.
+    // the path that removes the need for `privileged: true`.
+    if platform_config_bool(template, "share_process_namespace").unwrap_or(false) {
+        spec.insert(
+            "shareProcessNamespace".to_string(),
+            serde_json::json!(true),
+        );
+    }
+
     // Disable service account token auto-mounting for security hardening.
     // Sandbox pods should not have access to the Kubernetes API by default.
     spec.insert(
@@ -1239,6 +1251,9 @@ fn sandbox_template_to_k8s(
         serde_json::json!({
             "capabilities": {
                 "add": capabilities
+            },
+            "seccompProfile": {
+                "type": "Unconfined"
             }
         }),
     );

@@ -1286,6 +1286,26 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
         }
     }
 
+    // Cluster-wide boolean toggles. Parsed as bool with permissive truthy
+    // strings ("1", "true", "yes" — case-insensitive) and surfaced to the
+    // K8s driver as BoolValue so it can read them via platform_config_bool.
+    for (key, env_var) in [(
+        "share_process_namespace",
+        "OPENSHELL_SANDBOX_SHARE_PROCESS_NAMESPACE",
+    )] {
+        if let Ok(val) = std::env::var(env_var) {
+            let truthy = matches!(val.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+            if truthy {
+                fields.insert(
+                    key.to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(true)),
+                    },
+                );
+            }
+        }
+    }
+
     // node_selector needs StructValue (the K8s driver reads it via
     // platform_config_struct), so parse the JSON env var into a
     // prost Struct rather than passing it as a plain string.
