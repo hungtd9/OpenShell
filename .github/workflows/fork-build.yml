@@ -1,0 +1,136 @@
+name: Build Fork Images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/hungtd9/openshell
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            gateway_target: x86_64-unknown-linux-gnu
+            supervisor_target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            gateway_target: aarch64-unknown-linux-gnu
+            supervisor_target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.gateway_target }},${{ matrix.supervisor_target }}
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fork-build-${{ matrix.arch }}
+
+      - name: Build gateway binary
+        run: |
+          cargo build --release \
+            --target "${{ matrix.gateway_target }}" \
+            -p openshell-server \
+            --bin openshell-gateway \
+            --features openshell-core/dev-settings
+
+      - name: Build supervisor binary
+        run: |
+          cargo build --release \
+            --target "${{ matrix.supervisor_target }}" \
+            -p openshell-sandbox \
+            --bin openshell-sandbox \
+            --features openshell-core/dev-settings
+
+      - name: Stage prebuilt binaries
+        run: |
+          set -euo pipefail
+          stage="deploy/docker/.build/prebuilt-binaries/${{ matrix.arch }}"
+          mkdir -p "$stage"
+          install -m 0755 \
+            "target/${{ matrix.gateway_target }}/release/openshell-gateway" \
+            "$stage/openshell-gateway"
+          install -m 0755 \
+            "target/${{ matrix.supervisor_target }}/release/openshell-sandbox" \
+            "$stage/openshell-sandbox"
+          ls -lh "$stage/"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.gateway
+          target: gateway
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.REGISTRY }}/gateway:${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=gateway-${{ matrix.arch }}
+          cache-to: type=gha,scope=gateway-${{ matrix.arch }},mode=max
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.supervisor
+          target: supervisor
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.REGISTRY }}/supervisor:${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=supervisor-${{ matrix.arch }}
+          cache-to: type=gha,scope=supervisor-${{ matrix.arch }},mode=max
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ env.REGISTRY }}/gateway:${{ github.sha }}" \
+            --tag "${{ env.REGISTRY }}/gateway:latest" \
+            "${{ env.REGISTRY }}/gateway:${{ github.sha }}-amd64" \
+            "${{ env.REGISTRY }}/gateway:${{ github.sha }}-arm64"
+
+          docker buildx imagetools create \
+            --tag "${{ env.REGISTRY }}/supervisor:${{ github.sha }}" \
+            --tag "${{ env.REGISTRY }}/supervisor:latest" \
+            "${{ env.REGISTRY }}/supervisor:${{ github.sha }}-amd64" \
+            "${{ env.REGISTRY }}/supervisor:${{ github.sha }}-arm64"
